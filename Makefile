@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -pthread $(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 libuvc)
-LIBS = $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 libuvc) -lpthread
+LIBS = $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 libuvc) -lpthread -lm -ljpeg
 
 TARGET = file_saver
 OBJS = file_saver.o

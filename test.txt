@@ -9,28 +9,18 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <libuvc/libuvc.h>
-#include <errno.h>
-#include <math.h>
 
 #define MAX_PIPELINE_LEN 1024
 #define CAPTURE_RATE_HZ 5
 #define MAX_CAMERAS 2
-#define SYNC_THRESHOLD_MS 50.0 
 
-// Store device info
+// Structure to store discovered device info
 typedef struct {
     uvc_device_t *dev;
     char serial[64];
 } DiscoveredDevice;
 
-// Sync frame structure
-typedef struct {
-    double timestamp;
-    GstSample *sample;
-    gboolean valid;
-} SyncFrame;
-
-// Camera instance 
+// Camera instance structure
 typedef struct {
     int camera_id;
     char serial[64];
@@ -61,24 +51,7 @@ typedef struct {
     guint last_frame_count;
     // Thread for streaming
     pthread_t stream_thread;
-    // Directory paths
-    char base_dir[256];
-    char frames_dir[256];
-    char csv_dir[256];
-    // Synchronization
-    SyncFrame sync_frame;
-    double latest_timestamp;
 } CameraInstance;
-
-// Global sync context
-typedef struct {
-    pthread_mutex_t sync_mutex;
-    FILE *sync_csv;
-    char sync_csv_path[256];
-    char timestamp_dir[256];
-    guint sync_count;
-    double last_sync_time;
-} SyncContext;
 
 // Global context
 struct {
@@ -88,86 +61,19 @@ struct {
     pthread_t key_thread;
     pthread_t monitor_thread;
     volatile int should_stop;
-    uvc_context_t *uvc_ctx;  // Shared context for all cameras (It was the core issue)
-    SyncContext sync_ctx;
+    uvc_context_t *uvc_ctx;  // Shared context for all cameras
 } g_ctx;
 
-// Create directory recursively
-int create_directory_recursive(const char *path) {
-    char tmp[256];
-    char *p = NULL;
-    size_t len;
-    
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-    if (tmp[len - 1] == '/') {
-        tmp[len - 1] = 0;
-    }
-    
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-                return -1;
-            }
-            *p = '/';
+// Create output directory
+void create_output_dir(const char *dirname) {
+    struct stat st = {0};
+    if (stat(dirname, &st) == -1) {
+        if (mkdir(dirname, 0755) != 0) {
+            perror("Failed to create directory");
+        } else {
+            printf("Created directory: %s\n", dirname);
         }
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        return -1;
-    }
-    return 0;
-}
-
-// Create timestamp-based directory structure
-void create_timestamped_directories() {
-    struct timeval tv;
-    struct tm *tm_info;
-    char timestamp[64];
-    
-    gettimeofday(&tv, NULL);
-    tm_info = localtime(&tv.tv_sec);
-    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d_%06ld",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec, tv.tv_usec);
-    
-    // Create main timestamp directory
-    snprintf(g_ctx.sync_ctx.timestamp_dir, sizeof(g_ctx.sync_ctx.timestamp_dir), 
-             "captures/%s", timestamp);
-    create_directory_recursive(g_ctx.sync_ctx.timestamp_dir);
-    
-    // Create sync CSV file
-    snprintf(g_ctx.sync_ctx.sync_csv_path, sizeof(g_ctx.sync_ctx.sync_csv_path),
-             "%s/sync_frames.csv", g_ctx.sync_ctx.timestamp_dir);
-    
-    // Create camera directories
-    for (int i = 0; i < g_ctx.active_cameras; i++) {
-        CameraInstance *cam = &g_ctx.cameras[i];
-        
-        // Camera base directory
-        snprintf(cam->base_dir, sizeof(cam->base_dir),
-                 "%s/cam%d", g_ctx.sync_ctx.timestamp_dir, i);
-        create_directory_recursive(cam->base_dir);
-        
-        // Frames directory
-        snprintf(cam->frames_dir, sizeof(cam->frames_dir),
-                 "%s/frames", cam->base_dir);
-        create_directory_recursive(cam->frames_dir);
-        
-        // CSV directory
-        snprintf(cam->csv_dir, sizeof(cam->csv_dir),
-                 "%s/csv", cam->base_dir);
-        create_directory_recursive(cam->csv_dir);
-    }
-    
-    printf("Created directory structure in: %s\n", g_ctx.sync_ctx.timestamp_dir);
-}
-
-// Get timestamp in seconds
-double get_timestamp_seconds() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
 
 // Get timestamp string
@@ -182,159 +88,91 @@ void get_timestamp_string(char *buffer, size_t size) {
              tv.tv_usec);
 }
 
-// Save synchronized frame as JPEG
-void save_sync_frame_as_jpeg(CameraInstance *cam, GstSample *sample, double timestamp, const char *sync_id) {
+// Get timestamp in seconds
+double get_timestamp_seconds() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1000000.0;
+}
+
+// Save frame as JPEG
+void save_frame_as_jpeg(CameraInstance *cam, GstSample *sample) {
     GstBuffer *buffer;
     GstMapInfo map;
     char filename[256];
-    char filepath[512];
+    char timestamp[64];
     FILE *file;
-    
+    double ts_seconds;
+
     if (!sample) return;
-    
     buffer = gst_sample_get_buffer(sample);
     if (!buffer) return;
-    
+
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) {
         g_printerr("Camera %d: Failed to map buffer\n", cam->camera_id);
         return;
     }
-    
-    snprintf(filename, sizeof(filename), "sync_%s_cam%d.jpg", sync_id, cam->camera_id);
-    snprintf(filepath, sizeof(filepath), "%s/%s", cam->frames_dir, filename);
-    
-    file = fopen(filepath, "wb");
+
+    get_timestamp_string(timestamp, sizeof(timestamp));
+    snprintf(filename, sizeof(filename), "captures/cam%d_frame_%s.jpg", 
+             cam->camera_id, timestamp);
+    file = fopen(filename, "wb");
     if (file) {
         fwrite(map.data, 1, map.size, file);
         fclose(file);
-        
-        // Write to camera's CSV log
-        fprintf(cam->csv_file, "%s,%.6f\n", filename, timestamp);
+        ts_seconds = get_timestamp_seconds();
+        fprintf(cam->csv_file, "cam%d_frame_%s.jpg,%.6f\n", 
+                cam->camera_id, timestamp, ts_seconds);
         fflush(cam->csv_file);
-        
         cam->saved_count++;
-        printf("Camera %d: Saved sync frame %s at %.6f\n", 
-               cam->camera_id, filename, timestamp);
+        printf("Camera %d: Saved frame %u at %.6f\n", 
+               cam->camera_id, cam->saved_count, ts_seconds);
     }
-    
     gst_buffer_unmap(buffer, &map);
-}
-
-// Check for synchronized frames and save them
-void check_and_save_sync_frames() {
-    if (g_ctx.active_cameras < 2) return;
-    
-    pthread_mutex_lock(&g_ctx.sync_ctx.sync_mutex);
-    
-    CameraInstance *cam0 = &g_ctx.cameras[0];
-    CameraInstance *cam1 = &g_ctx.cameras[1];
-    
-    // Check if both cameras have valid frames
-    if (!cam0->sync_frame.valid || !cam1->sync_frame.valid ||
-        !cam0->sync_frame.sample || !cam1->sync_frame.sample) {
-        pthread_mutex_unlock(&g_ctx.sync_ctx.sync_mutex);
-        return;
-    }
-    
-    double time_diff = fabs(cam0->sync_frame.timestamp - cam1->sync_frame.timestamp);
-    
-    // Check if frames are synchronized within threshold
-    if (time_diff <= (SYNC_THRESHOLD_MS / 1000.0)) {
-        char sync_id[64];
-        double avg_timestamp = (cam0->sync_frame.timestamp + cam1->sync_frame.timestamp) / 2.0;
-        
-        snprintf(sync_id, sizeof(sync_id), "%06d", ++g_ctx.sync_ctx.sync_count);
-        
-        // Save synchronized frames
-        save_sync_frame_as_jpeg(cam0, cam0->sync_frame.sample, cam0->sync_frame.timestamp, sync_id);
-        save_sync_frame_as_jpeg(cam1, cam1->sync_frame.sample, cam1->sync_frame.timestamp, sync_id);
-        
-        // Write to sync CSV
-        fprintf(g_ctx.sync_ctx.sync_csv, "%s,%.6f,%.6f,%.6f,%.6f\n",
-                sync_id, avg_timestamp, 
-                cam0->sync_frame.timestamp, cam1->sync_frame.timestamp, 
-                time_diff * 1000.0);  // time diff in milliseconds
-        fflush(g_ctx.sync_ctx.sync_csv);
-        
-        printf("SYNC: Saved frame pair %s (diff: %.3f ms)\n", sync_id, time_diff * 1000.0);
-        
-        g_ctx.sync_ctx.last_sync_time = avg_timestamp;
-        
-        // Clear sync frames
-        if (cam0->sync_frame.sample) {
-            gst_sample_unref(cam0->sync_frame.sample);
-            cam0->sync_frame.sample = NULL;
-            cam0->sync_frame.valid = FALSE;
-        }
-        if (cam1->sync_frame.sample) {
-            gst_sample_unref(cam1->sync_frame.sample);
-            cam1->sync_frame.sample = NULL;
-            cam1->sync_frame.valid = FALSE;
-        }
-    } else {
-        // Remove the older frame
-        if (cam0->sync_frame.timestamp < cam1->sync_frame.timestamp) {
-            if (cam0->sync_frame.sample) {
-                gst_sample_unref(cam0->sync_frame.sample);
-                cam0->sync_frame.sample = NULL;
-                cam0->sync_frame.valid = FALSE;
-            }
-        } else {
-            if (cam1->sync_frame.sample) {
-                gst_sample_unref(cam1->sync_frame.sample);
-                cam1->sync_frame.sample = NULL;
-                cam1->sync_frame.valid = FALSE;
-            }
-        }
-    }
-    
-    pthread_mutex_unlock(&g_ctx.sync_ctx.sync_mutex);
 }
 
 // Appsink callback
 GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
     CameraInstance *cam = (CameraInstance *)user_data;
     GstSample *sample;
-    double timestamp;
-    
+
     sample = gst_app_sink_pull_sample(appsink);
     if (!sample) {
         return GST_FLOW_OK;
     }
-    
-    timestamp = get_timestamp_seconds();
+
     cam->samples_received++;
-    
     pthread_mutex_lock(&cam->capture_mutex);
     if (cam->latest_sample) {
         gst_sample_unref(cam->latest_sample);
     }
-    cam->latest_sample = gst_sample_ref(sample);
-    cam->latest_timestamp = timestamp;
+    cam->latest_sample = sample;
     pthread_mutex_unlock(&cam->capture_mutex);
-    
-    // Update sync frame
-    pthread_mutex_lock(&g_ctx.sync_ctx.sync_mutex);
-    if (cam->sync_frame.sample) {
-        gst_sample_unref(cam->sync_frame.sample);
-    }
-    cam->sync_frame.sample = gst_sample_ref(sample);
-    cam->sync_frame.timestamp = timestamp;
-    cam->sync_frame.valid = TRUE;
-    pthread_mutex_unlock(&g_ctx.sync_ctx.sync_mutex);
-    
-    gst_sample_unref(sample);
-    
+
     return GST_FLOW_OK;
 }
 
-// Timer callback for 5Hz synchronization check
+// Timer callback for 5Hz capture
 gboolean capture_timer_callback(gpointer user_data) {
-    if (g_ctx.should_stop) {
-        return FALSE;
+    CameraInstance *cam = (CameraInstance *)user_data;
+
+    if (!cam->is_active || !cam->is_streaming) {
+        return TRUE;
     }
-    
-    check_and_save_sync_frames();
+
+    pthread_mutex_lock(&cam->capture_mutex);
+    if (cam->latest_sample) {
+        save_frame_as_jpeg(cam, cam->latest_sample);
+    } else {
+        static int no_sample_count[MAX_CAMERAS] = {0};
+        no_sample_count[cam->camera_id]++;
+        if (no_sample_count[cam->camera_id] % 25 == 0) {
+            printf("Camera %d: No decoded samples available (checked %d times)\n", 
+                   cam->camera_id, no_sample_count[cam->camera_id]);
+        }
+    }
+    pthread_mutex_unlock(&cam->capture_mutex);
+
     return TRUE;
 }
 
@@ -343,7 +181,7 @@ static gboolean gst_bus_cb(GstBus *bus, GstMessage *message, gpointer data) {
     CameraInstance *cam = (CameraInstance *)data;
     GError *err = NULL;
     gchar *dbg = NULL;
-    
+
     switch (GST_MESSAGE_TYPE(message)) {
         case GST_MESSAGE_ERROR:
             gst_message_parse_error(message, &err, &dbg);
@@ -381,10 +219,10 @@ int camera_gst_init(CameraInstance *cam) {
     GstAppSinkCallbacks callbacks = {NULL};
     char pipeline_str[MAX_PIPELINE_LEN];
     char appsrc_name[32], appsink_name[32];
-    
+
     snprintf(appsrc_name, sizeof(appsrc_name), "appsrc_%d", cam->camera_id);
     snprintf(appsink_name, sizeof(appsink_name), "appsink_%d", cam->camera_id);
-    
+
     snprintf(pipeline_str, sizeof(pipeline_str),
              "appsrc name=%s is-live=true do-timestamp=true format=time ! "
              "queue max-size-buffers=0 max-size-time=0 max-size-bytes=0 ! "
@@ -395,18 +233,13 @@ int camera_gst_init(CameraInstance *cam) {
              "jpegenc quality=90 ! "
              "appsink name=%s emit-signals=true sync=false max-buffers=2 drop=true",
              appsrc_name, appsink_name);
-    
+
     pthread_mutex_init(&cam->capture_mutex, NULL);
     cam->latest_sample = NULL;
     cam->frames_received = 0;
     cam->samples_received = 0;
     cam->timer = g_timer_new();
-    
-    // Initialize sync frame
-    cam->sync_frame.sample = NULL;
-    cam->sync_frame.valid = FALSE;
-    cam->sync_frame.timestamp = 0.0;
-    
+
     GError *error = NULL;
     cam->pipeline = gst_parse_launch(pipeline_str, &error);
     if (!cam->pipeline) {
@@ -415,15 +248,14 @@ int camera_gst_init(CameraInstance *cam) {
         if (error) g_error_free(error);
         return FALSE;
     }
-    
+
     cam->appsrc = gst_bin_get_by_name(GST_BIN(cam->pipeline), appsrc_name);
     cam->appsink = gst_bin_get_by_name(GST_BIN(cam->pipeline), appsink_name);
-    
     if (!cam->appsrc || !cam->appsink) {
         g_printerr("Camera %d: Failed to get elements\n", cam->camera_id);
         return FALSE;
     }
-    
+
     caps = gst_caps_new_simple("video/x-h264",
         "stream-format", G_TYPE_STRING, "byte-stream",
         "alignment", G_TYPE_STRING, "au",
@@ -433,30 +265,30 @@ int camera_gst_init(CameraInstance *cam) {
         NULL);
     gst_app_src_set_caps(GST_APP_SRC(cam->appsrc), caps);
     gst_caps_unref(caps);
-    
+
     g_object_set(G_OBJECT(cam->appsrc),
                  "stream-type", 0,
                  "is-live", TRUE,
                  "format", GST_FORMAT_TIME,
                  NULL);
-    
+
     sink_caps = gst_caps_new_simple("image/jpeg", NULL);
     gst_app_sink_set_caps(GST_APP_SINK(cam->appsink), sink_caps);
     gst_caps_unref(sink_caps);
-    
+
     g_object_set(cam->appsink, 
                  "max-buffers", 2,
                  "drop", TRUE,
                  "sync", FALSE,
                  NULL);
-    
+
     callbacks.new_sample = on_new_sample;
     gst_app_sink_set_callbacks(GST_APP_SINK(cam->appsink), &callbacks, cam, NULL);
-    
+
     bus = gst_pipeline_get_bus(GST_PIPELINE(cam->pipeline));
     cam->bus_watch_id = gst_bus_add_watch(bus, gst_bus_cb, cam);
     gst_object_unref(bus);
-    
+
     printf("Camera %d: GStreamer pipeline initialized\n", cam->camera_id);
     return TRUE;
 }
@@ -468,12 +300,12 @@ void cb(uvc_frame_t *frame, void *ptr) {
     GstFlowReturn ret;
     GstMapInfo map;
     static int first_frame[MAX_CAMERAS] = {1, 1};
-    
+
     if (!cam->is_active || g_ctx.should_stop) return;
     if (frame->data_bytes == 0) return;
-    
+
     cam->frames_received++;
-    
+
     if (first_frame[cam->camera_id]) {
         printf("Camera %d: First frame received - %zu bytes\n", 
                cam->camera_id, frame->data_bytes);
@@ -484,13 +316,13 @@ void cb(uvc_frame_t *frame, void *ptr) {
         }
         first_frame[cam->camera_id] = 0;
     }
-    
+
     buffer = gst_buffer_new_allocate(NULL, frame->data_bytes, NULL);
     if (!buffer) {
         fprintf(stderr, "Camera %d: Failed to allocate buffer\n", cam->camera_id);
         return;
     }
-    
+
     GstClockTime ts = GST_CLOCK_TIME_NONE;
     if (cam->dwFrameInterval > 0) {
         ts = frame->sequence * (GstClockTime)cam->dwFrameInterval * 100;
@@ -498,7 +330,7 @@ void cb(uvc_frame_t *frame, void *ptr) {
     GST_BUFFER_PTS(buffer) = ts;
     GST_BUFFER_DTS(buffer) = ts;
     GST_BUFFER_DURATION(buffer) = (GstClockTime)cam->dwFrameInterval * 100;
-    
+
     if (gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
         memcpy(map.data, frame->data, frame->data_bytes);
         gst_buffer_unmap(buffer, &map);
@@ -506,16 +338,16 @@ void cb(uvc_frame_t *frame, void *ptr) {
         gst_buffer_unref(buffer);
         return;
     }
-    
+
     g_signal_emit_by_name(cam->appsrc, "push-buffer", buffer, &ret);
     gst_buffer_unref(buffer);
-    
+
     if (ret != GST_FLOW_OK && ret != GST_FLOW_FLUSHING) {
         if (cam->framecount % 100 == 0) {
             fprintf(stderr, "Camera %d: Push buffer returned %d\n", cam->camera_id, ret);
         }
     }
-    
+
     cam->framecount++;
     if (cam->framecount % 150 == 0) {
         g_print("Camera %d: Frames: %u, Decoded: %u, Saved: %u\n", 
@@ -537,11 +369,6 @@ void *monitor_thread(void *arg) {
                 cam->last_frame_count = cam->framecount;
             }
         }
-        
-        // Print sync statistics
-        pthread_mutex_lock(&g_ctx.sync_ctx.sync_mutex);
-        printf("SYNC STATUS: %u synchronized frame pairs captured\n", g_ctx.sync_ctx.sync_count);
-        pthread_mutex_unlock(&g_ctx.sync_ctx.sync_mutex);
     }
     return NULL;
 }
@@ -550,12 +377,12 @@ void *monitor_thread(void *arg) {
 void *camera_stream_thread(void *arg) {
     CameraInstance *cam = (CameraInstance *)arg;
     uvc_error_t res;
-    
+
     printf("Camera %d: Stream thread started\n", cam->camera_id);
-    
+
     // Stagger start to reduce USB contention
-    usleep(cam->camera_id * 5000000);  // 5 seconds per camera
-    
+    usleep(cam->camera_id * 3000000);  // 3 seconds per camera
+
     printf("Camera %d: Starting UVC streaming...\n", cam->camera_id);
     res = uvc_start_streaming(cam->devh, &cam->ctrl, cb, cam, 0);
     if (res < 0) {
@@ -565,14 +392,14 @@ void *camera_stream_thread(void *arg) {
         cam->is_active = FALSE;
         return NULL;
     }
-    
+
     cam->is_streaming = TRUE;
     printf("Camera %d: UVC streaming started successfully\n", cam->camera_id);
-    
+
     while (cam->is_active && !g_ctx.should_stop) {
         usleep(100000);
     }
-    
+
     printf("Camera %d: Stopping UVC streaming...\n", cam->camera_id);
     uvc_stop_streaming(cam->devh);
     cam->is_streaming = FALSE;
@@ -585,29 +412,27 @@ int find_theta_devices() {
     uvc_device_t **device_list;
     uvc_error_t res;
     int found = 0;
-    
+
     res = uvc_get_device_list(g_ctx.uvc_ctx, &device_list);
     if (res != UVC_SUCCESS) {
         fprintf(stderr, "Failed to get device list\n");
         return 0;
     }
-    
+
     printf("Scanning for RICOH THETA X cameras (0x05ca:0x2717)...\n");
-    
+
     for (int i = 0; device_list[i] != NULL && found < MAX_CAMERAS; i++) {
         uvc_device_descriptor_t *desc;
         if (uvc_get_device_descriptor(device_list[i], &desc) == UVC_SUCCESS) {
             if (desc->idVendor == 0x05ca && desc->idProduct == 0x2717) {
                 g_ctx.cameras[found].dev = device_list[i];
                 g_ctx.cameras[found].camera_id = found;
-                
                 if (desc->serialNumber) {
                     strncpy(g_ctx.cameras[found].serial, desc->serialNumber, 63);
                     g_ctx.cameras[found].serial[63] = '\0';
                 } else {
                     snprintf(g_ctx.cameras[found].serial, 64, "THETA_UNKNOWN_%d", found);
                 }
-                
                 uvc_ref_device(device_list[i]);  // Hold reference
                 printf("Found THETA X camera %d: Serial='%s'\n", found, g_ctx.cameras[found].serial);
                 found++;
@@ -615,7 +440,7 @@ int find_theta_devices() {
             uvc_free_device_descriptor(desc);
         }
     }
-    
+
     uvc_free_device_list(device_list, 0);  // Don't auto-unref — we use uvc_ref_device
     return found;
 }
@@ -624,24 +449,23 @@ int find_theta_devices() {
 int init_camera(CameraInstance *cam) {
     uvc_error_t res;
     char csv_filename[256];
-    char csv_filepath[512];
-    
+    char timestamp[64];
+
     cam->is_active = FALSE;
     cam->is_streaming = FALSE;
-    
-    // Create CSV log file in camera's CSV directory
-    snprintf(csv_filename, sizeof(csv_filename), "cam%d_frames.csv", cam->camera_id);
-    snprintf(csv_filepath, sizeof(csv_filepath), "%s/%s", cam->csv_dir, csv_filename);
-    
-    cam->csv_file = fopen(csv_filepath, "w");
+
+    get_timestamp_string(timestamp, sizeof(timestamp));
+    snprintf(csv_filename, sizeof(csv_filename), "captures/cam%d_log_%s.csv", 
+             cam->camera_id, timestamp);
+    cam->csv_file = fopen(csv_filename, "w");
     if (!cam->csv_file) {
         fprintf(stderr, "Camera %d: Failed to create CSV log file '%s': %s\n", 
-                cam->camera_id, csv_filepath, strerror(errno));
+                cam->camera_id, csv_filename, strerror(errno));
         return -1;
     }
     fprintf(cam->csv_file, "filename,timestamp_seconds\n");
-    printf("Camera %d: Created CSV log at %s\n", cam->camera_id, csv_filepath);
-    
+    printf("Camera %d: Created CSV log\n", cam->camera_id);
+
     res = uvc_open(cam->dev, &cam->devh);
     if (res < 0) {
         fprintf(stderr, "Camera %d: Failed to open device\n", cam->camera_id);
@@ -650,24 +474,6 @@ int init_camera(CameraInstance *cam) {
         return -1;
     }
     printf("Camera %d: Device opened\n", cam->camera_id);
-    
-    printf("Camera %d: Claiming all interfaces...\n", cam->camera_id);
-    for (int if_num = 0; if_num < 5; if_num++) {
-        res = uvc_claim_if(cam->devh, if_num);
-        if (res < 0) {
-            if (if_num == 0) {
-                fprintf(stderr, "Camera %d: FATAL - Failed to claim interface 0 (Imaging)\n", cam->camera_id);
-                fprintf(stderr, "This means usbfs is still holding the device\n");
-                uvc_close(cam->devh);
-                fclose(cam->csv_file);
-                return -1;
-            } else {
-                printf("Camera %d: Warning - Could not claim interface %d (non-critical)\n", cam->camera_id, if_num);
-            }
-        } else {
-            printf("Camera %d: Successfully claimed interface %d\n", cam->camera_id, if_num);
-        }
-    }
 
     res = uvc_get_stream_ctrl_format_size(
         cam->devh, &cam->ctrl,
@@ -684,19 +490,19 @@ int init_camera(CameraInstance *cam) {
     }
     printf("Camera %d: Format set - 1920x960 @ 29 fps\n", cam->camera_id);
     printf("Camera %d: Frame interval: %u\n", cam->camera_id, cam->ctrl.dwFrameInterval);
-    
+
     if (!camera_gst_init(cam)) {
         fprintf(stderr, "Camera %d: Failed to init GStreamer\n", cam->camera_id);
         uvc_close(cam->devh);
         fclose(cam->csv_file);
         return -1;
     }
-    
+
     cam->dwFrameInterval = cam->ctrl.dwFrameInterval;
     cam->framecount = 0;
     cam->saved_count = 0;
     cam->last_frame_count = 0;
-    
+
     GstStateChangeReturn state_ret = gst_element_set_state(cam->pipeline, GST_STATE_PLAYING);
     if (state_ret == GST_STATE_CHANGE_FAILURE) {
         fprintf(stderr, "Camera %d: Failed to start pipeline\n", cam->camera_id);
@@ -706,7 +512,10 @@ int init_camera(CameraInstance *cam) {
         return -1;
     }
     printf("Camera %d: Pipeline started\n", cam->camera_id);
-    
+
+    cam->timer_id = g_timeout_add(200, capture_timer_callback, cam);
+    printf("Camera %d: Capture timer started (5Hz)\n", cam->camera_id);
+
     cam->is_active = TRUE;
     return 0;
 }
@@ -715,11 +524,12 @@ int init_camera(CameraInstance *cam) {
 void cleanup_camera(CameraInstance *cam) {
     printf("Camera %d: Cleaning up...\n", cam->camera_id);
     cam->is_active = FALSE;
-    
     if (cam->stream_thread) {
         pthread_join(cam->stream_thread, NULL);
     }
-    
+    if (cam->timer_id > 0) {
+        g_source_remove(cam->timer_id);
+    }
     if (cam->pipeline) {
         gst_element_set_state(cam->pipeline, GST_STATE_NULL);
         if (cam->bus_watch_id > 0) {
@@ -732,54 +542,15 @@ void cleanup_camera(CameraInstance *cam) {
         if (cam->latest_sample) {
             gst_sample_unref(cam->latest_sample);
         }
-        if (cam->sync_frame.sample) {
-            gst_sample_unref(cam->sync_frame.sample);
-        }
         gst_object_unref(cam->pipeline);
     }
-    
     if (cam->devh) {
-        // Release all interfaces before closing
-        for (int if_num = 0; if_num < 5; if_num++) {
-            uvc_release_if(cam->devh, if_num);
-        }
         uvc_close(cam->devh);
         printf("Camera %d: Device closed\n", cam->camera_id);
     }
-    
     if (cam->csv_file) {
         fclose(cam->csv_file);
-        printf("Camera %d: Saved %u synchronized images\n", cam->camera_id, cam->saved_count);
-    }
-}
-
-// Initialize synchronization context
-void init_sync_context() {
-    pthread_mutex_init(&g_ctx.sync_ctx.sync_mutex, NULL);
-    g_ctx.sync_ctx.sync_count = 0;
-    g_ctx.sync_ctx.last_sync_time = 0.0;
-    
-    // Create sync CSV file
-    g_ctx.sync_ctx.sync_csv = fopen(g_ctx.sync_ctx.sync_csv_path, "w");
-    if (!g_ctx.sync_ctx.sync_csv) {
-        fprintf(stderr, "Failed to create sync CSV file: %s\n", strerror(errno));
-        return;
-    }
-    
-    fprintf(g_ctx.sync_ctx.sync_csv, 
-            "sync_id,avg_timestamp,cam0_timestamp,cam1_timestamp,time_diff_ms\n");
-    fflush(g_ctx.sync_ctx.sync_csv);
-    
-    printf("Sync CSV created: %s\n", g_ctx.sync_ctx.sync_csv_path);
-}
-
-// Cleanup synchronization context
-void cleanup_sync_context() {
-    pthread_mutex_destroy(&g_ctx.sync_ctx.sync_mutex);
-    
-    if (g_ctx.sync_ctx.sync_csv) {
-        fclose(g_ctx.sync_ctx.sync_csv);
-        printf("Synchronization complete: %u frame pairs captured\n", g_ctx.sync_ctx.sync_count);
+        printf("Camera %d: Saved %u images\n", cam->camera_id, cam->saved_count);
     }
 }
 
@@ -794,39 +565,25 @@ void *keywait(void *arg) {
 // Main
 int main(int argc, char **argv) {
     memset(&g_ctx, 0, sizeof(g_ctx));
-    
-    // Initialize GStreamer
+    create_output_dir("captures");
     gst_init(&argc, &argv);
-    
+
     // Initialize SINGLE shared UVC context
     uvc_error_t res = uvc_init(&g_ctx.uvc_ctx, NULL);
     if (res < 0) {
         uvc_perror(res, "uvc_init");
         return -1;
     }
-    
-    // Find cameras
+
     g_ctx.active_cameras = find_theta_devices();
     if (g_ctx.active_cameras == 0) {
         fprintf(stderr, "No RICOH THETA X cameras found\n");
         uvc_exit(g_ctx.uvc_ctx);
         return -1;
     }
-    
-    if (g_ctx.active_cameras < 2) {
-        fprintf(stderr, "Warning: Only %d camera found. Synchronization requires 2 cameras.\n", 
-                g_ctx.active_cameras);
-    }
-    
+
     printf("Found %d THETA X camera(s)\n", g_ctx.active_cameras);
-    
-    // Create timestamped directory structure
-    create_timestamped_directories();
-    
-    // Initialize synchronization
-    init_sync_context();
-    
-    // Initialize cameras
+
     int initialized = 0;
     for (int i = 0; i < g_ctx.active_cameras; i++) {
         CameraInstance *cam = &g_ctx.cameras[i];
@@ -838,21 +595,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to initialize camera %d\n", i);
         }
     }
-    
+
     if (initialized == 0) {
         fprintf(stderr, "No cameras initialized\n");
         goto cleanup;
     }
-    
+
     printf("%d camera(s) initialized\n", initialized);
-    
-    // Create main loop
+
     g_ctx.loop = g_main_loop_new(NULL, FALSE);
-    
-    // Start capture timer (5Hz synchronization check)
-    guint sync_timer_id = g_timeout_add(200, capture_timer_callback, NULL);
-    
-    // Start streaming threads
+
     printf("Starting streaming threads...\n");
     for (int i = 0; i < g_ctx.active_cameras; i++) {
         if (g_ctx.cameras[i].is_active) {
@@ -861,58 +613,33 @@ int main(int argc, char **argv) {
                           camera_stream_thread, &g_ctx.cameras[i]);
         }
     }
-    
-    // Start monitor thread
+
     pthread_create(&g_ctx.monitor_thread, NULL, monitor_thread, NULL);
-    
-    printf("\nSynchronized capture running at %d Hz from %d camera(s)\n", 
-           CAPTURE_RATE_HZ, initialized);
-    printf("Sync threshold: %.1f ms\n", SYNC_THRESHOLD_MS);
-    printf("Output directory: %s\n", g_ctx.sync_ctx.timestamp_dir);
+
+    printf("\nCapturing at %d Hz from %d camera(s)\n", CAPTURE_RATE_HZ, initialized);
     printf("Press ENTER to stop...\n");
-    
-    // Start keypress thread
     pthread_create(&g_ctx.key_thread, NULL, keywait, NULL);
-    
-    // Run main loop
+
     g_main_loop_run(g_ctx.loop);
-    
-    // Wait for keypress thread
     pthread_join(&g_ctx.key_thread, NULL);
-    
+
 cleanup:
-    printf("\nStopping synchronized capture...\n");
+    printf("\nStopping capture...\n");
     g_ctx.should_stop = 1;
-    
-    // Remove sync timer
-    if (sync_timer_id > 0) {
-        g_source_remove(sync_timer_id);
-    }
-    
-    // Wait for monitor thread
     if (g_ctx.monitor_thread) {
         pthread_join(g_ctx.monitor_thread, NULL);
     }
-    
-    // Cleanup cameras
     for (int i = 0; i < g_ctx.active_cameras; i++) {
         if (g_ctx.cameras[i].is_active) {
             cleanup_camera(&g_ctx.cameras[i]);
         }
     }
-    
-    // Cleanup sync context
-    cleanup_sync_context();
-    
-    // Cleanup UVC and GStreamer
     if (g_ctx.uvc_ctx) {
         uvc_exit(g_ctx.uvc_ctx);
     }
-    
     if (g_ctx.loop) {
         g_main_loop_unref(g_ctx.loop);
     }
-    
     printf("Done.\n");
     return 0;
-}   
+}
