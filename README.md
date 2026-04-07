@@ -43,4 +43,12 @@ make
 
 ## Usage
 
-Connect your RICOH THETA X to the host system via USB and run the built application. The viewer should open a live video stream from the camera.
+Connect your RICOH THETA X to the host system via USB.
+
+Before running the built application, execute:
+
+```bash
+sudo ./unblock_kernal.sh
+```
+
+Then run the viewer binary. The application should open a live video stream from the camera.
